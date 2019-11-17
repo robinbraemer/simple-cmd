@@ -62,8 +62,7 @@ func (b *bundle) Run(s string) error {
 				}
 
 				// arg is optional, means must be last arg
-				q.Run(ctx)
-				return nil
+				return q.Run(ctx)
 			}
 		}
 	}

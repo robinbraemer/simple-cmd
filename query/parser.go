@@ -2,19 +2,24 @@ package query
 
 import (
 	"errors"
+	"fmt"
+	"reflect"
+	"strconv"
 	"strings"
 )
 
 type Query interface {
 	Elements() []Element
 	Element(key string) Element
-	Run(Context)
+	Run(Context) error
 }
 
 type Element interface {
 	Key() string
 	Type() ElementType
 	Optional() bool
+	IsArray() bool
+	ArraySize() *int
 }
 
 type ElementType string
@@ -30,7 +35,7 @@ const (
 
 type query struct {
 	elements []Element
-	run      func(ctx Context)
+	fn       reflect.Value // the function
 }
 
 func (q *query) Elements() []Element {
@@ -45,8 +50,28 @@ func (q *query) Element(key string) Element {
 	return nil
 }
 
-func (q *query) Run(ctx Context) {
-	q.run(ctx)
+func (q *query) Run(ctx Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("error running query: %v", r)
+		}
+	}()
+
+	fnType := q.fn.Type()
+	numIn := fnType.NumIn()
+	args := make([]reflect.Value, 0, numIn)
+
+	for i := 0; i < numIn; i++ {
+		switch fnType.In(i) {
+		case reflect.TypeOf((*Context)(nil)).Elem():
+			args = append(args, reflect.ValueOf(ctx))
+		default:
+			return errors.New("unsupported query function")
+		}
+	}
+
+	q.fn.Call(args)
+	return nil
 }
 
 type Context interface {
@@ -57,14 +82,18 @@ type Context interface {
 	RequireArray(key string) []string
 }
 
-func New(rawQuery string, fn func(Context)) (Query, error) {
+func New(rawQuery string, fn interface{}) (Query, error) {
+	if fn == nil || reflect.TypeOf(fn).Kind() != reflect.Func {
+		return nil, errors.New("fn must be a function")
+	}
+
 	elements, err := parse(rawQuery)
 	if err != nil {
 		return nil, err
 	}
 	return &query{
 		elements: elements,
-		run:      fn,
+		fn:       reflect.ValueOf(fn),
 	}, nil
 }
 
@@ -87,27 +116,72 @@ func parse(rawQuery string) ([]Element, error) {
 }
 
 func parseElement(rawElement string) (Element, error) {
-	var optional bool
+	/*
+		"{a}"
+		"{a?}"
+		"{[]a}"
+		"{[]a?}"
+		"{[3]a}"
+		"{[3]a?}"
+	*/
 	if rawElement[0] == '{' {
+		// element is a value
+		var optional bool
+		var array bool
+		var arraySize *int
+
 		if rawElement[len(rawElement)-1] != '}' {
 			return nil, errors.New("missing closing bracket")
 		}
+
+		leftCursor := 1
+		if rawElement[1] == '[' {
+			// value is an array
+			array = true
+			// find closing bracket
+			arrayClosingAt := 2
+			for {
+				if rawElement[arrayClosingAt] == ']' {
+					break
+				}
+				arrayClosingAt++
+				if arrayClosingAt == len(rawElement)-1 {
+					// end of element
+					return nil, errors.New("missing closing array bracket")
+				}
+			}
+			leftCursor = arrayClosingAt + 1
+			if arrayClosingAt != 2 {
+				// array is not infinite as it doesn't close immediately -> "[]"
+				i, err := strconv.Atoi(rawElement[2:arrayClosingAt])
+				if err != nil {
+					return nil, errors.New("invalid array size")
+				}
+				if i < 1 {
+					// array size to small
+					return nil, errors.New("array size must not be < 1")
+				}
+				arraySize = &i
+			}
+		}
+
 		last := len(rawElement) - 1
-		if rawElement[last-1:last] == "?" {
+		if rawElement[last-1] == '?' {
 			optional = true
 			last--
 		}
-		key := rawElement[1:last]
+		key := rawElement[leftCursor:last]
 		if len(key) == 0 {
 			return nil, errors.New("missing key name")
 		}
 		return &element{
 			key:         key,
 			elementType: ElementTypeValue,
+			array:       array,
+			arraySize:   arraySize,
 			optional:    optional,
 		}, nil
-	}
-	if rawElement[len(rawElement)-1] == '}' {
+	} else if rawElement[len(rawElement)-1] == '}' {
 		return nil, errors.New("missing opening brackets")
 	}
 	return &element{
@@ -126,10 +200,18 @@ type element struct {
 	array bool
 	// The size of the array.
 	// Must be >= 2 or nil as infinitely as the last element in the query
-	arraySize *uint
+	arraySize *int
 	// Whether the element is optional.
 	// Must be the last element in the query.
 	optional bool
+}
+
+func (e *element) IsArray() bool {
+	return e.array
+}
+
+func (e *element) ArraySize() *int {
+	return e.arraySize
 }
 
 func (e *element) Key() string {
